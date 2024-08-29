@@ -23,7 +23,7 @@
 #include "common/reorder_pd.hpp"
 #include "gpu/gpu_primitive.hpp"
 #include "gpu/gpu_reorder_pd.hpp"
-#include "gpu/nvidia/cudnn_reorder_impl.hpp"
+#include "gpu/nvidia/cudnn_reorder_lt_impl.hpp"
 #include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
@@ -49,23 +49,26 @@ struct cudnn_reorder_lt_t : public gpu::primitive_t {
             ok = ok
                     && utils::one_of(dst_dt_, data_type::f32, data_type::s8,
                             data_type::s32);
-
+            // to ampere blocked
             ok = ok
-                    && IMPLICATION(src_dt_ == data_type::f32,
-                            utils::one_of(
-                                    dst_dt_, data_type::s8, data_type::s32));
+                    && IMPLICATION(utils::one_of(src_dt_, data_type::s8,
+                                           data_type::s32, data_type::f32),
+                            dst_dt_ == data_type::s8);
+            // from ampere blocked
             ok = ok
-                    && IMPLICATION(dst_dt_ == data_type::f32,
-                            utils::one_of(
-                                    src_dt_, data_type::s8, data_type::s32));
+                    && IMPLICATION(src_dt_ == data_type::s8,
+                            utils::one_of(dst_dt_, data_type::f32,
+                                    data_type::s32, data_type::s8));
 
-            src_float_ = src_dt_ == data_type_t::dnnl_f32;
-            dst_float_ = dst_dt_ == data_type_t::dnnl_f32;
+            src_float_ = src_dt_ == data_type::f32;
+            dst_float_ = dst_dt_ == data_type::f32;
 
             if (!ok) return ok;
 
             memory_desc_wrapper src_wrap(*src_md());
             memory_desc_wrapper dst_wrap(*dst_md());
+
+            ok = ok && src_wrap.ndims() <= 3 && dst_wrap.ndims() <= 3;
 
             // Only support transforming from plain to blocked format and vice-versa.
             ok = ok && IMPLICATION(src_wrap.is_plain(), !dst_wrap.is_plain());
@@ -77,32 +80,27 @@ struct cudnn_reorder_lt_t : public gpu::primitive_t {
 
             if (!ok) return ok;
 
-            auto ndims = src_wrap.ndims();
-            if (ndims > 3) { return false; }
-
             auto check_tag = [&](const memory_desc_wrapper &wrap,
                                      bool &transpose, format_kind_t &kind) {
-                kind=format_kind_t::dnnl_blocked;
-                if (wrap.is_plain()) {
-                    auto tag = wrap.matches_one_of_tag(dnnl_ab, dnnl_abc);
-                    if (tag != dnnl_format_tag_undef) {
-                        transpose = false;
-                        return tag;
-                    }
-                    tag = wrap.matches_one_of_tag(dnnl_ba, dnnl_acb);
-                    if (tag != dnnl_format_tag_undef) {
-                        transpose = true;
-                        return tag;
-                    }
-                }
-                if (wrap.is_blocking_desc()) {
-                    transpose = false;
-                    return wrap.matches_one_of_tag(dnnl_Ab32a, dnnl_aBc32b);
-                }
+                kind = format_kind_t::dnnl_blocked;
                 if (wrap.is_cublaslt_blocked_desc()) {
                     transpose = false;
                     kind = format_kind::cublaslt_blocked;
-                    return dnnl_format_tag_undef;
+                    return format_tag::undef;
+                }
+                if (wrap.is_plain()) {
+                    auto tag = wrap.matches_one_of_tag(
+                            format_tag::ab, format_tag::abc);
+                    if (tag != format_tag::undef) {
+                        transpose = false;
+                        return tag;
+                    }
+                    tag = wrap.matches_one_of_tag(
+                            format_tag::ba, format_tag::acb);
+                    if (tag != format_tag::undef) {
+                        transpose = true;
+                        return tag;
+                    }
                 }
                 return dnnl_format_tag_undef;
             };
@@ -110,14 +108,12 @@ struct cudnn_reorder_lt_t : public gpu::primitive_t {
             format_kind_t kind;
 
             src_tag_ = check_tag(src_wrap, src_trans_, kind);
-            ok = IMPLICATION(kind==dnnl_blocked, src_tag_!=dnnl_format_tag_undef);
+            ok = IMPLICATION(
+                    kind == dnnl_blocked, src_tag_ != dnnl_format_tag_undef);
 
             dst_tag_ = check_tag(dst_wrap, dst_trans_, kind);
-            ok = IMPLICATION(kind==dnnl_blocked, src_tag_!=dnnl_format_tag_undef);
-
-            ok = ok
-                    && !utils::one_of(
-                            dnnl_format_tag_undef, src_tag_, dst_tag_);
+            ok = IMPLICATION(
+                    kind == dnnl_blocked, dst_tag_ != dnnl_format_tag_undef);
             return ok;
         }
 
@@ -137,48 +133,52 @@ struct cudnn_reorder_lt_t : public gpu::primitive_t {
             return p.len() == 0 || (p.len() == 1 && p.entry_[0].is_sum(false));
         }
 
-        void init_internal_reorder(
-                impl::engine_t *engine, bool swap_src_dst = false) {
-            primitive_attr_t r_attr;
-            int mask = 0;
-            bool is_set = false;
-            auto src = swap_src_dst ? DNNL_ARG_DST : DNNL_ARG_SRC;
-            auto dst = swap_src_dst ? DNNL_ARG_SRC : DNNL_ARG_DST;
-            auto src_d = swap_src_dst ? dst_md() : src_md();
-            auto dst_d = swap_src_dst ? src_md() : dst_md();
-            attr()->scales_.get(src, &mask, &is_set);
-            if (is_set) { r_attr.scales_.set(src, mask); }
-
-            attr()->scales_.get(dst, &mask, &is_set);
-            if (is_set) { r_attr.scales_.set(dst, mask); }
-            reorder_primitive_desc_create(
-                    generic_reorder_desc_, engine, src_d, dst_d, &r_attr);
-        }
-
-        void init_scratchpad(impl::engine_t *engine) {
-            auto scratchpad = scratchpad_registry().registrar();
-            scratchpad.book(memory_tracking::names::key_nested,
-                    generic_reorder_desc_->scratchpad_registry());
-        }
         status_t init(impl::engine_t *engine, impl::engine_t *src_engine,
                 impl::engine_t *dst_engine) {
             const auto attr_skip_mask
                     = primitive_attr_t::skip_mask_t::scales_runtime
                     | primitive_attr_t::skip_mask_t::post_ops;
-            bool ok = engine == dst_engine
-                    && src_engine->kind() == engine_kind::gpu
-                    && valid_data_n_mem_format(engine)
+            bool ok = engine == dst_engine && valid_data_n_mem_format(engine)
                     && attr()->has_default_values(attr_skip_mask) && scales_ok()
                     && post_ops_ok();
+            if (!ok) return status::unimplemented;
 
-            if (src_float_) { init_internal_reorder(engine, false); }
-            if (dst_float_) { init_internal_reorder(engine, true); }
+            primitive_attr_t r_attr;
+            int mask = 0;
+            bool is_set = false;
+            auto src = DNNL_ARG_DST;
+            auto dst = DNNL_ARG_SRC;
+            if (src_float_) {
+                src_scratch_md_ = *src_md();
+                dst_scratch_md_ = create_temp_md(src_scratch_md_);
+                this->src_md_ = dst_scratch_md_;
+            } else if (dst_float_) {
+                src_scratch_md_ = create_temp_md(dst_scratch_md_);
+                dst_scratch_md_ = *dst_md();
+            }
+            attr()->scales_.get(src, &mask, &is_set);
+            if (is_set) { r_attr.scales_.set(src, mask); }
 
-            init_scratchpad(engine);
+            attr()->scales_.get(dst, &mask, &is_set);
+            if (is_set) { r_attr.scales_.set(dst, mask); }
+            //reorder_primitive_desc_create(generic_reorder_desc_, engine,
+            //        &src_scratch_md_, &dst_scratch_md_, &r_attr);
+            reorder_primitive_desc_create(generic_reorder_desc_, engine,
+                    &src_scratch_md_, src_engine, &dst_scratch_md_, dst_engine,
+                    &r_attr);
 
             if (!ok) return status::unimplemented;
-            return status::success;
-            // return reorder_->init(this);
+
+            return dnnl_success;
+        }
+
+        // Needed for internal reorder to convert src/dst from f32 to s8
+        memory_desc_t create_temp_md(const memory_desc_t &md) {
+            memory_desc_t temp;
+            temp = md;
+            temp.data_type = dnnl_s8;
+
+            return temp;
         }
 
         bool src_trans_ = false;
@@ -188,22 +188,39 @@ struct cudnn_reorder_lt_t : public gpu::primitive_t {
 
         data_type_t src_dt_;
         data_type_t dst_dt_;
+        memory_desc_t src_scratch_md_;
+        memory_desc_t dst_scratch_md_;
         format_tag_t src_tag_;
         format_tag_t dst_tag_;
-        // std::shared_ptr<cublaslt_reorder_generic_t> cublaslt_reorder_;
         std::shared_ptr<impl::primitive_desc_t> generic_reorder_desc_;
 
     private:
         DECLARE_GPU_REORDER_CREATE();
     };
 
+    status_t init(impl::engine_t *engine) override {
+        cublaslt_reorder_.reset(new cublaslt_reorder_t);
+        CHECK(cublaslt_reorder_->init((reorder_pd_t *)pd()));
+        cublaslt_reorder_->init_scratchpad(
+                (reorder_pd_t *)pd(), pd()->generic_reorder_desc_.get());
+        if ((pd()->src_float_ || pd()->dst_float_)) {
+            CHECK(create_nested_primitive(
+                    generic_reorder_, pd()->generic_reorder_desc_, engine));
+        }
+
+        return status::success;
+    }
+
     status_t execute(const exec_ctx_t &ctx) const override;
     status_t execute_internal_reorder(const exec_ctx_t &ctx,
             const memory_arg_t &src, const memory_arg_t &dst,
-            const memory_arg_t *src_scales, const memory_arg_t *dst_scales);
+            const memory_arg_t *src_scales,
+            const memory_arg_t *dst_scales) const;
 
 private:
     std::shared_ptr<impl::primitive_t> generic_reorder_;
+    std::shared_ptr<cublaslt_reorder_t> cublaslt_reorder_;
+
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
