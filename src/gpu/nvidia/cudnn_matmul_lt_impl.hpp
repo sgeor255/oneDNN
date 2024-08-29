@@ -87,7 +87,7 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         bool dst_row_major = !is_md_col_major(dst_d);
 
         // Initialise flags and variables for the imma case
-        handle_imma_case(src_d, weights_d, dst_d);
+        check_imma_case(src_d, weights_d, dst_d);
 
         // Check if bias can be used in the epilogue
         if (with_bias_) {
@@ -121,14 +121,18 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
 
         // Check if activation can be used in epilogue
         if (with_eltwise(0, pd) || with_eltwise(1, pd)) {
-            with_relu_ = eltwise_algo(pd) == alg_kind::eltwise_relu;
-            if (!with_relu_ || dst_row_major || with_separate_bias_) {
-                with_separate_eltwise_ = true;
+            if (dst_d.has_runtime_dims_or_strides()) {
+                return status::unimplemented;
+            } else {
+                with_relu_ = eltwise_algo(pd) == alg_kind::eltwise_relu;
+                if (!with_relu_ || dst_row_major || with_separate_bias_) {
+                    with_separate_eltwise_ = true;
+                }
             }
         }
         with_relu_epilogue_ = with_relu_ && !with_separate_eltwise_;
 
-        // Seperate bias or activation is not supported
+        // Separate activation is not supported and separate bias in non-imma case not supported.
         if ((with_separate_bias_ && !imma_case_) || with_separate_eltwise_) {
             return status::unimplemented;
         }
@@ -159,18 +163,6 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
 
         imma_ampere_case_ = imma_case_ && supports_ampere_layout;
         imma_plain_case_ = imma_case_ && !imma_ampere_case_;
-        if (imma_plain_case_) {
-            const bool all_plain_layout = src_d.is_plain()
-                    && weights_d.is_plain() && dst_d.is_plain();
-            // The plain imma configuration requires TN->N
-            const bool is_tnn = is_md_col_major(src_d)
-                    && !is_md_col_major(weights_d) && is_md_col_major(dst_d);
-            // The plain imma configuration is only supported if dimensions are multiples of 4
-            const bool are_dims_ok = M_ % 4 == 0 && K_ % 4 == 0 && N_ % 4 == 0;
-            if (!(is_tnn && all_plain_layout && are_dims_ok)) {
-                return status::unimplemented;
-            }
-        }
 
         // Set parameter when post-op sum is specified
         if (with_sum(pd)) { post_op_sum_ = sum_scale(pd); }
@@ -180,107 +172,93 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         if (dst_d.data_type() == dnnl_s8) {
             alpha_beta_size_bytes_ = sizeof(float);
         }
+        alpha_ = std::malloc(alpha_beta_size_bytes_);
+        beta_ = std::malloc(alpha_beta_size_bytes_);
 
         // Initialise all gemm parameters
         if (!has_runtime_params_) {
-            init_parameters(src_d, weights_d, dst_d, bias_d, engine);
+            CHECK(init_parameters(src_d, weights_d, dst_d, bias_d, engine));
             init_scratchpad(pd);
         }
 
         return status::success;
     }
 
-    status_t init_gemm_parameters(const memory_desc_wrapper src_d,
-            const memory_desc_wrapper weights_d,
-            const memory_desc_wrapper dst_d) override {
-        // C matrix is the dst
-        trans_c_ = is_md_col_major(dst_d) ? cublasOperation_t::CUBLAS_OP_N
-                                          : cublasOperation_t::CUBLAS_OP_T;
-        // A matrix is the weights
-        trans_a_ = is_md_col_major(weights_d) ? cublasOperation_t::CUBLAS_OP_N
-                                              : cublasOperation_t::CUBLAS_OP_T;
-        // B matrix is the src
-        trans_b_ = is_md_col_major(src_d) ? cublasOperation_t::CUBLAS_OP_N
-                                          : cublasOperation_t::CUBLAS_OP_T;
-        if (imma_ampere_case_) {
-            // IMMA kernels support only NT->N config
-            if (w_blocked_) { trans_a_ = cublasOperation_t::CUBLAS_OP_N; }
-            if (dst_blocked_) { trans_c_ = cublasOperation_t::CUBLAS_OP_N; }
-        }
-
-        if (dst_d.data_type() == dnnl_s8 || dst_d.data_type() == dnnl_bf16) {
-            CHECK(get_cublas_data_type(dnnl_f32, acc_type_));
-        } else {
-            CHECK(get_cublas_data_type(dst_d.data_type(), acc_type_));
-        }
-        CHECK(get_cublas_data_type(src_d.data_type(), src_type_));
-        CHECK(get_cublas_data_type(weights_d.data_type(), weights_type_));
-        CHECK(get_cublas_data_type(dst_d.data_type(), dst_type_));
-
-        if (dst_d.data_type() == dnnl_f16 && src_d.data_type() == dnnl_f16
-                && weights_d.data_type() == dnnl_f16) {
-            compute_type_ = CUBLAS_COMPUTE_16F;
-        } else if (src_d.data_type() == dnnl_s8
-                && weights_d.data_type() == dnnl_s8
+    void check_imma_case(const memory_desc_wrapper &src_d,
+            const memory_desc_wrapper &weights_d,
+            const memory_desc_wrapper &dst_d) {
+        if (src_d.data_type() == dnnl_s8 && weights_d.data_type() == dnnl_s8
                 && (dst_d.data_type() == dnnl_s32
                         || dst_d.data_type() == dnnl_s8)) {
-            compute_type_ = CUBLAS_COMPUTE_32I;
+            // weights blocked in Ab32a
+            w_blocked_ = is_md_col32(weights_d);
+            bool weights_supported = weights_d.has_runtime_dims_or_strides()
+                    || w_blocked_ || weights_d.is_plain();
+
+            // src not blocked
+            src_blocked_ = src_d.is_cublaslt_blocked_desc();
+            bool src_supported = src_d.has_runtime_dims_or_strides()
+                    || src_blocked_ || src_d.is_plain();
+
+            // dst blocked in Ab32a
+            dst_blocked_ = is_md_col32(dst_d);
+            bool dst_supported = dst_d.has_runtime_dims_or_strides()
+                    || dst_blocked_ || dst_d.is_plain();
+
+            imma_case_ = weights_supported && src_supported && dst_supported;
+            if (imma_case_) {
+                CUBLAS_EXECUTE_FUNC(cublasLtMatrixTransformDescCreate,
+                        &trans_desc_, CUDA_R_32I);
+            }
         }
-
-        CUBLAS_EXECUTE_FUNC(cublasLtMatmulDescCreate, &operation_desc_,
-                compute_type_, acc_type_);
-
-        if (batch_count_ != 1) {
-            stride_a_ = get_batch_stride(weights_d);
-            stride_b_ = get_batch_stride(src_d);
-            stride_c_ = get_batch_stride(dst_d);
-
-            // Enable broadcast semantics.
-            if (src_d.dims()[0] > weights_d.dims()[0])
-                stride_a_ = 0;
-            else if (src_d.dims()[0] < weights_d.dims()[0])
-                stride_b_ = 0;
-        }
-
-        if (!imma_ampere_case_) {
-            create_non_blocked_layouts();
-        } else {
-            create_blocked_layouts();
-        }
-
-        return status::success;
     }
 
     status_t init_parameters(const memory_desc_wrapper src_d,
             const memory_desc_wrapper weights_d,
             const memory_desc_wrapper dst_d, const memory_desc_wrapper bias_d,
             impl::engine_t *engine) {
-
-        alpha_ = std::malloc(alpha_beta_size_bytes_);
-        beta_ = std::malloc(alpha_beta_size_bytes_);
-
-        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
-        impl::stream_t *service_stream;
-        CHECK(sycl_engine.get_service_stream(service_stream));
-
-        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
-
-        auto cublas_handle = cuda_stream->get_cublas_handle();
-        auto lt_handle = (cublasLtHandle_t)cublas_handle;
-
+        batch_count_ = isbatched_ ? dst_d.dims()[0] : 1;
         M_ = static_cast<uint64_t>(dst_d.dims()[isbatched_ + 1]);
         N_ = static_cast<uint64_t>(dst_d.dims()[isbatched_ + 0]);
         K_ = static_cast<uint64_t>(src_d.dims()[isbatched_ + 1]);
 
-        CHECK(init_imma_sizes(src_d, weights_d, dst_d));
+        if (is_imma_case()) {
+            w_blocked_ = is_md_col32(weights_d);
+            dst_blocked_ = is_md_col32(dst_d);
+
+            if (!imma_ampere_case_) {
+                const bool all_plain_layout = src_d.is_plain()
+                        && weights_d.is_plain() && dst_d.is_plain();
+                // The plain imma configuration requires TN->N
+                const bool is_tnn = is_md_col_major(src_d)
+                        && !is_md_col_major(weights_d)
+                        && is_md_col_major(dst_d);
+                // The plain imma configuration is only supported if dimensions are multiples of 4
+                const bool are_dims_ok
+                        = M_ % 4 == 0 && K_ % 4 == 0 && N_ % 4 == 0;
+                if (!(is_tnn && all_plain_layout && are_dims_ok)) {
+                    return status::unimplemented;
+                }
+            } else {
+                CHECK(init_imma_ampere_sizes(src_d, weights_d, dst_d));
+            }
+        }
 
         // Matmul supports runtime paramters for dimensions and scales.
         // We need to initialize them in the execute function.
         CHECK(init_gemm_parameters(src_d, weights_d, dst_d));
 
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+
+        impl::stream_t *service_stream;
+        CHECK(sycl_engine.get_service_stream(service_stream));
+
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
+        auto cublas_handle = cuda_stream->get_cublas_handle();
+        auto lt_handle = (cublasLtHandle_t)cublas_handle;
         CHECK(init_scratchpad_size(lt_handle, src_d, weights_d, dst_d));
 
-        if (with_bias_) {
+        if (with_separate_bias_) {
             // Initialise cuDNN descriptors
             cudnnDataType_t data_types[NUM_IO];
             int ndims = dst_d.ndims() < 4 ? 4 : dst_d.ndims();
@@ -308,32 +286,91 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         return status::success;
     }
 
-    status_t init_imma_sizes(const memory_desc_wrapper &src_d,
-            const memory_desc_wrapper &weights_d,
-            const memory_desc_wrapper &dst_d) {
-        weight_size_ = 0;
-        dest_size_ = 0;
-        source_size_ = 0;
+    status_t init_gemm_parameters(const memory_desc_wrapper src_d,
+            const memory_desc_wrapper weights_d,
+            const memory_desc_wrapper dst_d) override {
+        // C matrix is the dst
+        trans_c_ = !is_md_col_major(dst_d);
+        // A matrix is the weights
+        trans_a_ = !is_md_col_major(weights_d);
+        // B matrix is the src
+        trans_b_ = !is_md_col_major(src_d);
 
         if (imma_ampere_case_) {
-            a_blocked_ld_ = c_blocked_ld_ = M_ * 32;
-            b_blocked_ld_ = ceildiv(N_, static_cast<uint64_t>(32)) * 32 * 32;
-            stride_b_blocked_
-                    = ceildiv(K_, static_cast<uint64_t>(32)) * b_blocked_ld_;
-            source_size_
-                    = batch_count_ * stride_b_blocked_ * src_d.data_type_size()*32;
-            stride_a_blocked_
-                    = ceildiv(K_, static_cast<uint64_t>(32)) * a_blocked_ld_;
-            if (!w_blocked_) {
-                weight_size_ = batch_count_ * stride_a_blocked_
-                        * weights_d.data_type_size() * 32;
+            // IMMA kernels support only NT->N config
+            //trans_b_ = false;
+            if (w_blocked_) { trans_a_ = false; }
+            if (dst_blocked_) { trans_c_ = false; }
+        }
+
+        if (dst_d.data_type() == dnnl_s8 || dst_d.data_type() == dnnl_bf16) {
+            CHECK(get_cublas_data_type(dnnl_f32, acc_type_));
+        } else {
+            CHECK(get_cublas_data_type(dst_d.data_type(), acc_type_));
+        }
+        CHECK(get_cublas_data_type(src_d.data_type(), src_type_));
+        CHECK(get_cublas_data_type(weights_d.data_type(), weights_type_));
+        CHECK(get_cublas_data_type(dst_d.data_type(), dst_type_));
+
+        if (dst_d.data_type() == dnnl_f16 && src_d.data_type() == dnnl_f16
+                && weights_d.data_type() == dnnl_f16) {
+            compute_type_ = CUBLAS_COMPUTE_16F;
+        } else if (src_d.data_type() == dnnl_s8
+                && weights_d.data_type() == dnnl_s8
+                && (dst_d.data_type() == dnnl_s32
+                        || dst_d.data_type() == dnnl_s8)) {
+            compute_type_ = CUBLAS_COMPUTE_32I;
+        }
+
+        CUBLAS_EXECUTE_FUNC(cublasLtMatmulDescCreate, &operation_desc_,
+                compute_type_, acc_type_);
+
+        if (batch_count_ != 1) {
+            stride_a_ = get_batch_stride(weights_d);
+            stride_b_ = src_d.is_cublaslt_blocked_desc()
+                    ? (K_ * N_)
+                    : get_batch_stride(src_d);
+            stride_c_ = get_batch_stride(dst_d);
+
+            // Enable broadcast semantics.
+            if (src_d.dims()[0] > weights_d.dims()[0]) {
+                stride_a_ = 0;
+                stride_a_blocked_ = 0;
+            } else if (src_d.dims()[0] < weights_d.dims()[0]) {
+                stride_b_ = 0;
+                stride_b_blocked_ = 0;
             }
-            stride_c_blocked_
-                    = ceildiv(N_, static_cast<uint64_t>(32)) * c_blocked_ld_;
-            if (!dst_blocked_) {
-                dest_size_ = batch_count_ * stride_c_blocked_
-                        * dst_d.data_type_size() * 32;
-            }
+        }
+
+        if (!imma_ampere_case_) {
+            create_non_blocked_layouts();
+        } else {
+            create_blocked_layouts();
+        }
+
+        return status::success;
+    }
+
+    status_t init_imma_ampere_sizes(const memory_desc_wrapper &src_d,
+            const memory_desc_wrapper &weights_d,
+            const memory_desc_wrapper &dst_d) {
+        a_blocked_ld_ = c_blocked_ld_ = M_ * 32;
+        b_blocked_ld_ = ceildiv(N_, static_cast<uint64_t>(32)) * 32 * 32;
+        stride_b_blocked_
+                = ceildiv(K_, static_cast<uint64_t>(32)) * b_blocked_ld_;
+        source_size_ = batch_count_ * stride_b_blocked_ * src_d.data_type_size()
+                * 32;
+        stride_a_blocked_
+                = ceildiv(K_, static_cast<uint64_t>(32)) * a_blocked_ld_;
+        if (!w_blocked_) {
+            weight_size_ = batch_count_ * stride_a_blocked_
+                    * weights_d.data_type_size() * 32;
+        }
+        stride_c_blocked_
+                = ceildiv(N_, static_cast<uint64_t>(32)) * c_blocked_ld_;
+        if (!dst_blocked_) {
+            dest_size_ = batch_count_ * stride_c_blocked_
+                    * dst_d.data_type_size() * 32;
         }
         return status::success;
     }
@@ -420,6 +457,20 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         }
     }
 
+    // #define DUMP_CUDA_TENSOR(dev_ptr, size, datatype) \
+//     { \
+//         std::vector<datatype> host_ctr(size); \
+//         cudaMemcpy(host_ctr.data(), dev_ptr, (size) * sizeof(datatype), \
+//                 cudaMemcpyDeviceToHost); \
+//         cudaDeviceSynchronize(); \
+//         std::cout << #dev_ptr << "\n"; \
+//         for (auto i = 0; i < (size); i++) { \
+//             std::cout << static_cast<int>(host_ctr[i]) << ", "; \
+//             if ((i + 1) % 32 == 0) std::cout << std::endl; \
+//         } \
+//         std::cout << "\n\n"; \
+//     }
+
     void execute(cublasHandle_t cublas_handle, cudnnHandle_t cudnn_handle,
             void *a, void *b, void *c, void *bias, void *algo_scratch,
             void *reorder_scratch, void *block_a_scratch, void *block_b_scratch,
@@ -435,9 +486,13 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         CUBLAS_EXECUTE_FUNC(cublasGetStream, cublas_handle, &streamId);
 
         if (imma_ampere_case_) {
-            transform_matrix(lt_handle, b_layout_, b, blocked_b_layout_,
-                    block_b_scratch, !trans_b_, streamId);
-            b = block_b_scratch;
+            if (!src_blocked_) {
+                transform_matrix(lt_handle, b_layout_, b, blocked_b_layout_,
+                        block_b_scratch, !trans_b_, streamId);
+                b = block_b_scratch;
+                std::cout << "---- In matmul: \n";
+                // DUMP_CUDA_TENSOR(b, 1024, int8_t);
+            }
             if (!w_blocked_) {
                 transform_matrix(lt_handle, a_layout_, a, blocked_a_layout_,
                         block_a_scratch, trans_a_, streamId);
@@ -581,31 +636,6 @@ struct cudnn_matmul_lt_impl_t : cudnn_matmul_base_impl_t {
         }
     }
 
-    void handle_imma_case(const memory_desc_wrapper &src_d,
-            const memory_desc_wrapper &weights_d,
-            const memory_desc_wrapper &dst_d) {
-        if (src_d.data_type() == dnnl_s8 && weights_d.data_type() == dnnl_s8
-                && (dst_d.data_type() == dnnl_s32
-                        || dst_d.data_type() == dnnl_s8)) {
-            // weights blocked in Ab32a
-            w_blocked_ = is_md_col32(weights_d);
-            bool weights_supported = w_blocked_ || weights_d.is_plain();
-
-            // src not blocked
-            bool src_supported = src_d.is_plain();
-
-            // dst blocked in Ab32a
-            dst_blocked_ = is_md_col32(dst_d);
-            bool dst_supported = dst_blocked_ || dst_d.is_plain();
-
-            imma_case_ = weights_supported && src_supported && dst_supported;
-            if (imma_case_) {
-                CUBLAS_EXECUTE_FUNC(cublasLtMatrixTransformDescCreate,
-                        &trans_desc_, CUDA_R_32I);
-            }
-        }
-    }
-
     bool is_imma_case() { return imma_case_; }
 
     size_t algo_scratch_size() { return algo_scratch_size_; }
@@ -644,11 +674,12 @@ private:
     bool imma_ampere_case_ = false;
     bool imma_plain_case_ = false;
     bool w_blocked_ = false;
+    bool src_blocked_ = false;
     bool dst_blocked_ = false;
     cublasLtMatrixTransformDesc_t trans_desc_;
-    uint64_t source_size_;
-    uint64_t weight_size_;
-    uint64_t dest_size_;
+    uint64_t source_size_ = 0;
+    uint64_t weight_size_ = 0;
+    uint64_t dest_size_ = 0;
 
     uint64_t M_, N_, K_;
 
@@ -656,7 +687,7 @@ private:
             stride_b_blocked_, stride_c_blocked_, a_blocked_ld_, b_blocked_ld_,
             c_blocked_ld_;
 
-    bool trans_a_, trans_b_, trans_c_;
+    bool trans_a_ = false, trans_b_ = false, trans_c_ = false;
 
     cublasComputeType_t compute_type_ = CUBLAS_COMPUTE_32F;
 
@@ -765,12 +796,14 @@ private:
                     weights_type_, CUBLASLT_MATMUL_DESC_TRANSA, stride_a_);
         }
 
-        row = K_;
-        col = N_;
-        if (trans_b_) { std::swap(row, col); }
-        create_matrix_layout(b_layout_, CUBLASLT_ORDER_COL,
-                cublasOperation_t::CUBLAS_OP_N, row, col, row, src_type_,
-                CUBLASLT_MATMUL_DESC_TRANSB, stride_b_);
+        if (!src_blocked_) {
+            row = K_;
+            col = N_;
+            if (trans_b_) { std::swap(row, col); }
+            create_matrix_layout(b_layout_, CUBLASLT_ORDER_COL,
+                    cublasOperation_t::CUBLAS_OP_N, row, col, row, src_type_,
+                    CUBLASLT_MATMUL_DESC_TRANSB, stride_b_);
+        }
 
         if (!dst_blocked_) {
             row = M_;
@@ -789,8 +822,11 @@ private:
     }
 
     bool is_md_col_major(const memory_desc_wrapper &md) {
-        const auto &md_strides = &md.blocking_desc().strides[isbatched_];
-        return (md_strides[1] == 1 && md.dims()[isbatched_ + 0] > 1);
+        if (md.is_blocking_desc()) {
+            const auto &md_strides = &md.blocking_desc().strides[isbatched_];
+            return (md_strides[1] == 1 && md.dims()[isbatched_ + 0] > 1);
+        }
+        return false;
     }
 
     void maybe_swap(uint64_t &row, uint64_t &col, cublasOperation_t &op,

@@ -28,10 +28,10 @@ namespace nvidia {
 struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
     using cudnn_matmul_base_t::cudnn_matmul_base_t;
 
-    struct pd_t : public pd_base_t {
-        using pd_base_t::pd_base_t;
+    struct pd_t : public cudnn_matmul_base_pd_t {
+        using cudnn_matmul_base_pd_t::cudnn_matmul_base_pd_t;
 
-        DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_matmul_lt_t);
+        DECLARE_COMMON_PD_T("cuda:cublaslt:any", cudnn_matmul_lt_t);
 
         status_t init(impl::engine_t *engine) override {
             using namespace data_type;
@@ -48,25 +48,29 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
             bool bf16_case = utils::everyone_is(bf16, src_dt, wei_dt, dst_dt);
 #ifdef DNNL_NO_IMMA_INT8_DST
             bool s8_case = utils::everyone_is(s8, src_dt, wei_dt)
-                    && utils::one_of(dst_dt, s8, s32);
-#else
-            bool s8_case = utils::everyone_is(s8, src_dt, wei_dt)
                     && utils::one_of(dst_dt, s32);
+#else
+            bool s8_case = false;
+            if (has_imma_dst_int8_support()) {
+                s8_case = utils::everyone_is(s8, src_dt, wei_dt)
+                        && utils::one_of(dst_dt, s8, s32);
+            } else {
+                s8_case = utils::everyone_is(s8, src_dt, wei_dt)
+                        && utils::one_of(dst_dt, s32);
+            }
 #endif
             auto *sycl_engine_impl
                     = utils::downcast<const xpu::sycl::engine_impl_t *>(
                             engine->impl());
 
-            bool is_imma_blocks = imma_blocks();
             bool is_eltwise_ok = eltwise_ok();
 
-            bool ok = is_dense_format_kind()
-                    && (blocking_ok() || is_imma_blocks)
+            bool ok = is_dense_format_kind() && blocking_ok()
                     && attr()->has_default_values(smask_t::scales_runtime)
                     && attr_post_ops_ok(attr())
                     && IMPLICATION(bf16_case,
                             has_bf16_support(sycl_engine_impl->device()))
-                    && set_default_formats()
+                    && set_default_formats_lt()
                     && (f32_case || f16_case || bf16_case || s8_case)
                     && IMPLICATION(with_bias(),
                             (IMPLICATION(f32_case, utils::one_of(bia_dt, f32))
@@ -80,13 +84,16 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
                                     && IMPLICATION(!s8_case, bia_dt == dst_dt)))
                     && IMPLICATION(with_bias(), !has_runtime_dims_or_strides());
 
+            memory_desc_wrapper src_wrap(src_md(0, true));
             memory_desc_wrapper weight_wrap(weights_md());
             memory_desc_wrapper dst_wrap(dst_md());
 
+            ok = ok && src_wrap.ndims() <= 3;
             ok = ok
                     && IMPLICATION(
                             is_md_col32(weight_wrap) || is_md_col32(dst_wrap),
                             s8_case);
+            bool is_imma_blocks = imma_blocks();
             ok = ok && (is_imma_blocks || dst_ok()) && bias_ok()
                     && is_eltwise_ok;
             if (!ok) return status::unimplemented;
@@ -119,7 +126,7 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
                 }
                 if (!binary_pd_) return status::unimplemented;
             }
-            status_t status;
+            status_t status = status_t::dnnl_success;
             if (!single_scale(DNNL_ARG_SRC)) {
                 auto scale_md = dnnl_memory_desc();
                 scale_md.ndims = attr()->scales_.get(DNNL_ARG_SRC).ndims_;
@@ -149,7 +156,8 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
                         wei_scale_binary_pd_, weights_md(0), scale_md,
                         alg_kind::binary_mul);
             }
-            if (status == status_t::dnnl_success) {
+            if (!single_scale(DNNL_ARG_DST)
+                    && status == status_t::dnnl_success) {
                 auto scale_md = dnnl_memory_desc();
                 scale_md.ndims = attr()->scales_.get(DNNL_ARG_DST).ndims_;
                 scale_md.data_type
@@ -251,11 +259,16 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
             bool ok = false;
 
             memory_desc_wrapper dst_wrap(dst_md());
-            //check if dst is col_major
             bool isbatched = batched() && dst_wrap.dims()[0];
-            const auto &md_strides
-                    = &dst_wrap.blocking_desc().strides[isbatched];
-            ok = (md_strides[1] == 1 && dst_wrap.dims()[isbatched + 0] > 1);
+            //check if dst is col_major
+            if (dst_wrap.is_plain()) {
+                const auto &md_strides
+                        = &dst_wrap.blocking_desc().strides[isbatched];
+                ok = (md_strides[1] == 1 && dst_wrap.dims()[isbatched + 0] > 1);
+            } else {
+                // Ensure blocked format is Ab32a or aBc32b
+                ok = is_md_col32(*dst_md());
+            }
             // dst not supported for ndims = 1
             ok = ok
                     && (dst_wrap.dims()[isbatched + 1] != 1
@@ -322,10 +335,12 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
             if (is_md_col32(weight_wrap) || weight_wrap.is_plain()) {
                 weights_supported = true;
             }
-            // src not blocked
+            // src plain format or internal cublaslt format
             bool src_supported = false;
             memory_desc_wrapper src_wrap(src_md());
-            if (src_wrap.is_plain()) { src_supported = true; }
+            if (src_wrap.is_plain() || src_wrap.is_cublaslt_blocked_desc()) {
+                src_supported = true;
+            }
             // dst blocked in Ab32a, ab or ba
             bool dst_supported = false;
             memory_desc_wrapper dst_wrap(dst_md());
@@ -333,6 +348,45 @@ struct cudnn_matmul_lt_t : cudnn_matmul_base_t {
                 dst_supported = true;
             }
             return (weights_supported && src_supported && dst_supported);
+        }
+        bool set_default_formats_lt() {
+            memory_desc_wrapper w_wrap(this->weights_md_);
+            if (w_wrap.format_any()) {
+                auto n_dims = batched() ? 3 : 2;
+                auto tag = batched() ? format_tag::aBc32b : format_tag::Ab32a;
+                memory_desc_init_by_tag(this->weights_md_, n_dims,
+                        w_wrap.dims(), w_wrap.data_type(), tag);
+            }
+
+            memory_desc_wrapper dst_wrap(dst_md());
+            if (dst_wrap.format_any()) {
+                auto n_dims = batched() ? 3 : 2;
+                auto tag = batched() ? format_tag::aBc32b : format_tag::Ab32a;
+                memory_desc_init_by_tag(this->dst_md_, n_dims, dst_wrap.dims(),
+                        dst_wrap.data_type(), tag);
+            }
+
+            memory_desc_wrapper src_wrap(this->src_md_);
+            if (src_wrap.format_any()) {
+
+                auto ceildiv = [](dim_t n, dim_t d) { return (n + d - 1) / d; };
+                auto n_rows = 32 * ceildiv(src_wrap.dims()[batched()], 32);
+                auto n_cols = 32 * ceildiv(src_wrap.dims()[batched() + 1], 32);
+                auto n_batch = batched() ? src_wrap.dims()[0] : 1;
+                size_t size = n_batch * n_rows * n_cols;
+
+                //this->src_md_.padded_dims[batched()] = n_rows;
+                //this->src_md_.padded_dims[batched() + 1] = n_cols;
+                auto n_dims = batched() ? 3 : 2;
+                auto tag = batched() ? format_tag::abc : format_tag::ab;
+                memory_desc_init_by_tag(this->src_md_, n_dims, src_wrap.dims(),
+                        src_wrap.data_type(), tag);
+                this->src_md_.format_kind = format_kind::cublaslt_blocked;
+                this->src_md_.format_desc.cublaslt_blocked_desc
+                        = cublaslt_blocked_desc_t {
+                                cublaslt_memory_format_t::ampere_blocked, size};
+            }
+            return true;
         }
     };
 
