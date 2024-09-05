@@ -35,17 +35,17 @@ namespace sycl {
 #define CTX_IN_SYCL_KERNEL_MEMORY(arg) \
     CTX_IN_STORAGE(arg).is_null() \
             ? xpu::sycl::memory_storage_base_t::empty_in_memory_arg( \
-                    ctx.stream(), cgh) \
+                      ctx.stream(), cgh) \
             : utils::downcast<const xpu::sycl::memory_storage_base_t *>( \
-                    &CTX_IN_STORAGE(arg)) \
+                      &CTX_IN_STORAGE(arg)) \
                       ->get_in_memory_arg(ctx.stream(), cgh)
 
 #define CTX_OUT_SYCL_KERNEL_MEMORY(arg) \
     CTX_OUT_STORAGE(arg).is_null() \
             ? xpu::sycl::memory_storage_base_t::empty_out_memory_arg( \
-                    ctx.stream(), cgh) \
+                      ctx.stream(), cgh) \
             : utils::downcast<const xpu::sycl::memory_storage_base_t *>( \
-                    &CTX_OUT_STORAGE(arg)) \
+                      &CTX_OUT_STORAGE(arg)) \
                       ->get_out_memory_arg(ctx.stream(), cgh)
 
 #define CHECK_SYCL_KERNEL_ARG_TYPE(type) \
